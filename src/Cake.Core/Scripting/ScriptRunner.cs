@@ -2,16 +2,16 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
 using Cake.Core.Configuration;
 using Cake.Core.Diagnostics;
 using Cake.Core.IO;
-using Cake.Core.Polyfill;
 using Cake.Core.Reflection;
 using Cake.Core.Scripting.Analysis;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Reflection;
 
 namespace Cake.Core.Scripting
 {
@@ -150,8 +150,7 @@ namespace Cake.Core.Scripting
 
             // Load all references.
             var applicationRoot = _environment.ApplicationRoot;
-            var assemblies = new HashSet<Assembly>();
-            assemblies.AddRange(_conventions.GetDefaultAssemblies(applicationRoot));
+            var assemblyMap = _conventions.GetDefaultAssemblies(applicationRoot).ToDictionary(a => a.GetName().Name);
 
             foreach (var reference in result.References)
             {
@@ -159,7 +158,12 @@ namespace Cake.Core.Scripting
                 if (host.Context.FileSystem.Exist(referencePath))
                 {
                     var assembly = _assemblyLoader.Load(referencePath, true);
-                    assemblies.Add(assembly);
+                    var assemblyName = assembly.GetName();
+                    if (!assemblyMap.ContainsKey(assemblyName.Name)
+                        || assemblyMap[assemblyName.Name].GetName().Version.CompareTo(assemblyName.Version) < 0)
+                    {
+                        assemblyMap[assemblyName.Name] = assembly;
+                    }
                 }
                 else
                 {
@@ -167,6 +171,16 @@ namespace Cake.Core.Scripting
                     session.AddReference(referencePath);
                 }
             }
+
+            var assemblies = assemblyMap.Values;
+
+#if !NETCORE
+            foreach (var assembly in assemblies)
+            {
+                this.RedirectToAssembly(assembly);
+            }
+
+#endif
 
             var aliases = new List<ScriptAlias>();
 
@@ -200,6 +214,37 @@ namespace Cake.Core.Scripting
             var script = new Script(result.Namespaces, result.Lines, aliases, result.UsingAliases);
             session.Execute(script);
         }
+
+#if !NETCORE
+        public void RedirectToAssembly(Assembly assembly)
+        {
+            var assemblyName = assembly.GetName();
+            ResolveEventHandler handler = null;
+
+            handler = (sender, args) =>
+            {
+                var requestedAssembly = new AssemblyName(args.Name);
+                if (requestedAssembly.Name != assemblyName.Name)
+                {
+                    return null;
+                }
+
+                _log.Write(
+                    Verbosity.Verbose,
+                    LogLevel.Verbose,
+                    "Redirecting assembly load of " + args.Name + ",\tloaded by " + (args.RequestingAssembly == null ? "(unknown)" : args.RequestingAssembly.FullName));
+
+                requestedAssembly.Version = assemblyName.Version;
+                requestedAssembly.SetPublicKeyToken(assemblyName.GetPublicKeyToken());
+                requestedAssembly.CultureInfo = CultureInfo.InvariantCulture;
+
+                AppDomain.CurrentDomain.AssemblyResolve -= handler;
+
+                return Assembly.Load(requestedAssembly);
+            };
+            AppDomain.CurrentDomain.AssemblyResolve += handler;
+        }
+#endif
 
         private DirectoryPath GetToolPath(DirectoryPath root)
         {
